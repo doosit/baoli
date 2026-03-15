@@ -1,7 +1,7 @@
 #!name= 保利签到
 #!desc= 自动抓取并执行保利会员小程序每日签到
 #!author= doosit
-#!homepage= https://github.com/doosit/baoli
+#!homepage= https://github.com/doosit
 
 [MITM]
 hostname = a.china-smartech.com
