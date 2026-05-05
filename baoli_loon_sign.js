@@ -70,18 +70,27 @@ const DEFAULT_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS 
 const SCRIPT_NAME = "保利签到";
 const LOCK_KEY = "baoli.loon.runtime.lock";
 const LOCK_TTL_MS = 2 * 60 * 1000;
+const LOCK_CLEANUP_GRACE_MS = 10 * 1000;
+const WATCHDOG_TIMEOUT_MS = 95 * 1000;
 const MAX_NOTIFICATION_DETAIL = 240;
 
 const runtimeState = {
   runId: createRunId(),
   lockAcquired: false,
+  lockOptional: false,
   completed: false,
   lastMessage: "",
+  watchdogTimer: null,
 };
 
-main();
+try {
+  main();
+} catch (error) {
+  handleFatalError(error);
+}
 
 function main() {
+  startWatchdog();
   const args = parseArgument(typeof $argument === "string" ? $argument : "");
   const detectedActionKey = detectActionFromRequest();
   const actionKey = args.action || detectedActionKey || DEFAULT_ACTION;
@@ -98,7 +107,9 @@ function main() {
   }
 
   if (!acquireLock(actionKey)) {
-    finish("检测到脚本已在运行", false, "为避免重复签到，本次执行已跳过");
+    const lock = readJSON(LOCK_KEY);
+    const detail = lock ? formatLockDetail(lock) : "检测到有效运行锁。";
+    finish("检测到脚本已在运行", false, `${detail} 为避免重复签到，本次执行已跳过`);
     return;
   }
 
@@ -174,7 +185,11 @@ function captureRequest(action) {
 
 function replayRequest(action) {
   executeAction(action, function(result) {
-    notifyResult(result);
+    try {
+      notifyResult(result);
+    } catch (error) {
+      notify(SCRIPT_NAME, "通知结果失败", truncateText(error && error.message ? error.message : String(error)));
+    }
     done();
   });
 }
@@ -685,6 +700,7 @@ function done(value) {
     return;
   }
   runtimeState.completed = true;
+  stopWatchdog();
   releaseLock();
   if (typeof $done === "function") {
     if (typeof value !== "undefined") {
@@ -756,6 +772,41 @@ function createRunId() {
   return `run_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
+function startWatchdog() {
+  if (typeof setTimeout !== "function" || runtimeState.watchdogTimer) {
+    return;
+  }
+  runtimeState.watchdogTimer = setTimeout(function() {
+    if (runtimeState.completed) {
+      return;
+    }
+    finish("执行超时，已自动结束并释放锁", false, "请稍后重试；如果连续出现，请重新打开小程序刷新抓包。");
+  }, WATCHDOG_TIMEOUT_MS);
+}
+
+function stopWatchdog() {
+  if (!runtimeState.watchdogTimer || typeof clearTimeout !== "function") {
+    runtimeState.watchdogTimer = null;
+    return;
+  }
+  clearTimeout(runtimeState.watchdogTimer);
+  runtimeState.watchdogTimer = null;
+}
+
+function handleFatalError(error) {
+  const message = error && error.stack ? error.stack : error && error.message ? error.message : String(error);
+  try {
+    finish("脚本异常，已自动释放锁", false, truncateText(message));
+  } catch (finishError) {
+    releaseLock();
+    if (typeof $done === "function") {
+      $done({
+        body: truncateText(`脚本异常: ${message}`, 500),
+      });
+    }
+  }
+}
+
 function setRuntimeMessage(message) {
   runtimeState.lastMessage = truncateText(message || "", 500);
 }
@@ -772,8 +823,11 @@ function acquireLock(actionKey) {
   }
   const now = Date.now();
   const current = readJSON(LOCK_KEY);
-  if (current && current.runId && current.expiresAt && Number(current.expiresAt) > now && current.runId !== runtimeState.runId) {
+  if (isActiveLock(current, now)) {
     return false;
+  }
+  if (current) {
+    cleanupLock(current, now);
   }
   const lock = {
     runId: runtimeState.runId,
@@ -782,17 +836,65 @@ function acquireLock(actionKey) {
     createdAt: now,
   };
   const ok = writeJSON(LOCK_KEY, lock);
-  runtimeState.lockAcquired = Boolean(ok);
-  return ok;
+  if (!ok) {
+    runtimeState.lockOptional = true;
+    log("写入运行锁失败，已降级继续执行。");
+    return true;
+  }
+  const saved = readJSON(LOCK_KEY);
+  if (!saved || saved.runId !== runtimeState.runId) {
+    runtimeState.lockOptional = true;
+    log("运行锁校验失败，已降级继续执行。");
+    return true;
+  }
+  runtimeState.lockAcquired = true;
+  return true;
 }
 
 function releaseLock() {
-  if (!runtimeState.lockAcquired || typeof $persistentStore === "undefined") {
+  if ((!runtimeState.lockAcquired && !runtimeState.lockOptional) || typeof $persistentStore === "undefined") {
     return;
   }
   const current = readJSON(LOCK_KEY);
   if (current && current.runId === runtimeState.runId) {
-    $persistentStore.write("", LOCK_KEY);
+    try {
+      $persistentStore.write("", LOCK_KEY);
+    } catch (e) {
+      log(`释放运行锁失败: ${String(e)}`);
+    }
   }
   runtimeState.lockAcquired = false;
+  runtimeState.lockOptional = false;
+}
+
+function isActiveLock(lock, now) {
+  if (!lock || !lock.runId || lock.runId === runtimeState.runId) {
+    return false;
+  }
+  const expiresAt = Number(lock.expiresAt || 0);
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+function cleanupLock(lock, now) {
+  const expiresAt = Number(lock && lock.expiresAt || 0);
+  const expiredFor = Number.isFinite(expiresAt) && expiresAt > 0 ? now - expiresAt : 0;
+  if (!lock.runId || expiredFor >= LOCK_CLEANUP_GRACE_MS || !Number.isFinite(expiresAt)) {
+    try {
+      $persistentStore.write("", LOCK_KEY);
+      log(`已清理异常运行锁: ${formatLockDetail(lock)}`);
+    } catch (e) {
+      log(`清理异常运行锁失败: ${String(e)}`);
+    }
+  }
+}
+
+function formatLockDetail(lock) {
+  if (!lock || typeof lock !== "object") {
+    return "锁内容为空或已损坏。";
+  }
+  const action = lock.action ? `action=${lock.action}` : "action=unknown";
+  const created = lock.createdAt ? `创建于 ${formatAge(lock.createdAt)}` : "创建时间未知";
+  const expiresAt = Number(lock.expiresAt || 0);
+  const expires = expiresAt > Date.now() ? `预计 ${Math.ceil((expiresAt - Date.now()) / 1000)} 秒后过期` : "已过期";
+  return `${action} | ${created} | ${expires}`;
 }
