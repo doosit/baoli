@@ -69,9 +69,9 @@ const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.69(0x18004531) NetType/4G Language/zh_CN";
 const SCRIPT_NAME = "保利签到";
 const LOCK_KEY = "baoli.loon.runtime.lock";
-const LOCK_TTL_MS = 2 * 60 * 1000;
-const LOCK_CLEANUP_GRACE_MS = 10 * 1000;
-const WATCHDOG_TIMEOUT_MS = 95 * 1000;
+const LOCK_TTL_MS = 60 * 1000;
+const LOCK_CLOCK_SKEW_MS = 5 * 1000;
+const WATCHDOG_TIMEOUT_MS = 55 * 1000;
 const MAX_NOTIFICATION_DETAIL = 240;
 
 const runtimeState = {
@@ -827,7 +827,7 @@ function acquireLock(actionKey) {
     return false;
   }
   if (current) {
-    cleanupLock(current, now);
+    cleanupLock(current);
   }
   const lock = {
     runId: runtimeState.runId,
@@ -871,20 +871,43 @@ function isActiveLock(lock, now) {
   if (!lock || !lock.runId || lock.runId === runtimeState.runId) {
     return false;
   }
+  if (isAbnormalLock(lock, now)) {
+    return false;
+  }
   const expiresAt = Number(lock.expiresAt || 0);
-  return Number.isFinite(expiresAt) && expiresAt > now;
+  return expiresAt > now;
 }
 
-function cleanupLock(lock, now) {
-  const expiresAt = Number(lock && lock.expiresAt || 0);
-  const expiredFor = Number.isFinite(expiresAt) && expiresAt > 0 ? now - expiresAt : 0;
-  if (!lock.runId || expiredFor >= LOCK_CLEANUP_GRACE_MS || !Number.isFinite(expiresAt)) {
-    try {
-      $persistentStore.write("", LOCK_KEY);
-      log(`已清理异常运行锁: ${formatLockDetail(lock)}`);
-    } catch (e) {
-      log(`清理异常运行锁失败: ${String(e)}`);
-    }
+function isAbnormalLock(lock, now) {
+  if (!lock || typeof lock !== "object" || !lock.runId) {
+    return true;
+  }
+  const createdAt = Number(lock.createdAt || 0);
+  const expiresAt = Number(lock.expiresAt || 0);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(expiresAt) || createdAt <= 0 || expiresAt <= 0) {
+    return true;
+  }
+  if (createdAt - now > LOCK_CLOCK_SKEW_MS) {
+    return true;
+  }
+  if (now - createdAt >= LOCK_TTL_MS) {
+    return true;
+  }
+  if (expiresAt - createdAt > LOCK_TTL_MS + LOCK_CLOCK_SKEW_MS) {
+    return true;
+  }
+  if (expiresAt <= now) {
+    return true;
+  }
+  return false;
+}
+
+function cleanupLock(lock) {
+  try {
+    $persistentStore.write("", LOCK_KEY);
+    log(`已清理异常运行锁: ${formatLockDetail(lock)}`);
+  } catch (e) {
+    log(`清理异常运行锁失败: ${String(e)}`);
   }
 }
 
